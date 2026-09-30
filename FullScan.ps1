@@ -1,19 +1,25 @@
 # ============================================================
-# FullScan.ps1 - Network Disk Analyzer
-# Scans folder, finds old/large files, generates reports
-# Shows how much space can be freed
+# FullScan.ps1 - Network Disk Analyzer (Recursive Version)
+# Рекурсивно сканирует все папки всех уровней
+# Определяет реальных владельцев папок и файлов
 # ============================================================
 
 # ===== SETTINGS =====
-$SharePath  = "G:\net\share"
-$DaysOld    = 730
-$MinSizeMB  = 50
-$OutputDir  = "C:\temp\reports"
-$HtmlDir    = "C:\temp\html_reports"
-$SummaryCSV = "C:\temp\SummaryReport.csv"
-$LogFile    = "C:\temp\FullScanLog.txt"
-$CutoffDate = (Get-Date).AddDays(-$DaysOld)
-$Deadline   = (Get-Date).AddDays(14).ToString("dd.MM.yyyy")
+$SharePath      = "G:\expnet.ru\Common"
+$DaysOld        = 730
+$MinSizeMB      = 50
+$OutputDir      = "C:\temp\reports"
+$HtmlDir        = "C:\temp\html_reports"
+$SummaryCSV     = "C:\temp\SummaryReport.csv"
+$LogFile        = "C:\temp\FullScanLog.txt"
+
+# Режим определения владельца:
+# $false = по папкам (БЫСТРО, рекомендуется) - владелец папки = владелец всех файлов в ней
+# $true  = по файлам (МЕДЛЕННО, но точно) - для каждого файла отдельный запрос к NTFS
+$FileOwnerMode  = $false
+
+$CutoffDate     = (Get-Date).AddDays(-$DaysOld)
+$Deadline       = (Get-Date).AddDays(14).ToString("dd.MM.yyyy")
 
 # Create output directories
 if (!(Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
@@ -24,9 +30,11 @@ Start-Transcript -Path $LogFile -Append | Out-Null
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "SCAN STARTED: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Path: $SharePath" -ForegroundColor White
+Write-Host "Mode: $(if ($FileOwnerMode) {'FILE OWNER (slow)'} else {'FOLDER OWNER (fast)'})" -ForegroundColor White
+Write-Host ""
 
 # ===== PATH VALIDATION =====
-Write-Host ""
 Write-Host "Target folder: $SharePath" -ForegroundColor Cyan
 Write-Host "Criteria: older than $DaysOld days AND larger than $MinSizeMB MB" -ForegroundColor Cyan
 Write-Host "Cutoff date: $($CutoffDate.ToString('yyyy-MM-dd'))" -ForegroundColor Cyan
@@ -40,7 +48,7 @@ if (!(Test-Path $SharePath)) {
 }
 
 # ===== FUNCTIONS =====
-function Get-FolderOwner {
+function Get-ItemOwner {
     param([string]$Path)
     try {
         $acl = Get-Acl -Path $Path -ErrorAction Stop
@@ -64,87 +72,114 @@ function Format-Size {
     return "$Bytes B"
 }
 
-# ===== MAIN SCAN (with try/catch for safe interrupt) =====
+# ===== MAIN SCAN =====
 $usersData = @{}
 $summaryReport = @()
 $scanStartTime = Get-Date
 
 try {
-    $folders = Get-ChildItem -Path $SharePath -Directory -ErrorAction SilentlyContinue
+    # РЕКУРСИВНОЕ сканирование всех папок всех уровней
+    Write-Host "Collecting all folders recursively..." -ForegroundColor Yellow
+    $allFolders = Get-ChildItem -Path $SharePath -Directory -Recurse -ErrorAction SilentlyContinue
+    Write-Host "Found $($allFolders.Count) folders total (all levels)" -ForegroundColor Green
+    
+    # Также файлы в корне
     $rootFiles = Get-ChildItem -Path $SharePath -File -ErrorAction SilentlyContinue
-
-    Write-Host "Found $($folders.Count) subfolders" -ForegroundColor Green
     Write-Host "Found $($rootFiles.Count) files in root" -ForegroundColor Green
     Write-Host ""
-
-    $totalFolders = $folders.Count
+    
+    $totalFolders = $allFolders.Count
     $current = 0
-
-    foreach ($folder in $folders) {
+    
+    foreach ($folder in $allFolders) {
         $current++
         $elapsed = (Get-Date) - $scanStartTime
         $elapsedMin = [math]::Round($elapsed.TotalMinutes, 1)
         
-        Write-Progress -Activity "Scanning folders" -Status "$($folder.Name) ($current/$totalFolders) [$elapsedMin min]" -PercentComplete (($current/$totalFolders)*100)
-        Write-Host "[$current/$totalFolders] $($folder.Name)" -ForegroundColor Yellow
-
-        $owner = Get-FolderOwner -Path $folder.FullName
-
-        $allFiles = Get-ChildItem -Path $folder.FullName -Recurse -File -ErrorAction SilentlyContinue
-        $totalSize = ($allFiles | Measure-Object -Property Length -Sum).Sum
+        # Показываем относительный путь для наглядности
+        $relativePath = $folder.FullName.Replace($SharePath, "").TrimStart("\")
+        
+        Write-Progress -Activity "Scanning folders" -Status "$relativePath ($current/$totalFolders) [$elapsedMin min]" -PercentComplete (($current/$totalFolders)*100)
+        
+        if ($current % 10 -eq 0 -or $current -eq 1) {
+            Write-Host "[$current/$totalFolders] $relativePath" -ForegroundColor Yellow
+        }
+        
+        # Определяем владельца
+        if ($FileOwnerMode) {
+            # В режиме пофайлового сканирования владелец определяется для каждого файла отдельно
+            $folderOwner = "per-file"
+        } else {
+            # В режиме по папкам - владелец папки
+            $folderOwner = Get-ItemOwner -Path $folder.FullName
+        }
+        
+        # Сканируем файлы ТОЛЬКО в этой папке (без рекурсии, чтобы не дублировать)
+        $folderFiles = Get-ChildItem -Path $folder.FullName -File -ErrorAction SilentlyContinue
+        $totalSize = ($folderFiles | Measure-Object -Property Length -Sum).Sum
         if ($null -eq $totalSize) { $totalSize = 0 }
-
-        $badFiles = $allFiles | Where-Object { 
+        
+        # Фильтруем старые и большие файлы
+        $badFiles = $folderFiles | Where-Object { 
             $_.LastWriteTime -lt $CutoffDate -and $_.Length -ge ($MinSizeMB * 1MB) 
         }
         $badSize = ($badFiles | Measure-Object -Property Length -Sum).Sum
         if ($null -eq $badSize) { $badSize = 0 }
         $badCount = @($badFiles).Count
-
+        
+        # Добавляем в сводный отчёт
         $summaryReport += [PSCustomObject]@{
-            Folder      = $folder.Name
-            Owner       = $owner
-            TotalFiles  = @($allFiles).Count
+            Folder      = $relativePath
+            Owner       = $folderOwner
+            TotalFiles  = @($folderFiles).Count
             TotalSizeGB = [math]::Round($totalSize / 1GB, 2)
             BadFiles    = $badCount
             BadSizeGB   = [math]::Round($badSize / 1GB, 2)
             Path        = $folder.FullName
         }
-
+        
+        # Обрабатываем старые файлы для персональных отчётов
         if ($badCount -gt 0) {
-            if (!$usersData.ContainsKey($owner)) {
-                $usersData[$owner] = @{
-                    TotalBadSize = 0
-                    TotalBadCount = 0
-                    Files = @()
-                }
-            }
-            $usersData[$owner].TotalBadSize += $badSize
-            $usersData[$owner].TotalBadCount += $badCount
-            
             foreach ($f in $badFiles) {
-                $usersData[$owner].Files += [PSCustomObject]@{
+                # Определяем владельца файла
+                if ($FileOwnerMode) {
+                    $fileOwner = Get-ItemOwner -Path $f.FullName
+                } else {
+                    $fileOwner = $folderOwner
+                }
+                
+                if (!$usersData.ContainsKey($fileOwner)) {
+                    $usersData[$fileOwner] = @{
+                        TotalBadSize = 0
+                        TotalBadCount = 0
+                        Files = @()
+                    }
+                }
+                $usersData[$fileOwner].TotalBadSize += $f.Length
+                $usersData[$fileOwner].TotalBadCount += 1
+                
+                $usersData[$fileOwner].Files += [PSCustomObject]@{
                     Name = $f.Name
                     SizeMB = [math]::Round($f.Length / 1MB, 2)
                     Date = $f.LastWriteTime.ToString("yyyy-MM-dd")
                     Path = $f.FullName
-                    Folder = $folder.Name
+                    Folder = $relativePath
                 }
             }
         }
-
-        # Intermediate CSV save every 20 folders
-        if ($current % 20 -eq 0) {
+        
+        # Промежуточное сохранение каждые 50 папок
+        if ($current % 50 -eq 0) {
             $summaryReport | Sort-Object BadSizeGB -Descending | Export-Csv -Path $SummaryCSV -NoTypeInformation -Encoding UTF8
-            Write-Host "  [Intermediate save] CSV updated" -ForegroundColor DarkGray
+            Write-Host "  [Intermediate save] CSV updated ($current folders)" -ForegroundColor DarkGray
         }
     }
-
-    # Root files
+    
+    # Обработка файлов в корне
     if ($rootFiles.Count -gt 0) {
         Write-Host ""
         Write-Host "Scanning root files..." -ForegroundColor Yellow
-        $rootOwner = Get-FolderOwner -Path $SharePath
+        $rootOwner = Get-ItemOwner -Path $SharePath
         
         $rootTotalSize = ($rootFiles | Measure-Object -Property Length -Sum).Sum
         if ($null -eq $rootTotalSize) { $rootTotalSize = 0 }
@@ -167,18 +202,20 @@ try {
         }
         
         if ($rootBadCount -gt 0) {
-            if (!$usersData.ContainsKey($rootOwner)) {
-                $usersData[$rootOwner] = @{
-                    TotalBadSize = 0
-                    TotalBadCount = 0
-                    Files = @()
-                }
-            }
-            $usersData[$rootOwner].TotalBadSize += $rootBadSize
-            $usersData[$rootOwner].TotalBadCount += $rootBadCount
-            
             foreach ($f in $rootBadFiles) {
-                $usersData[$rootOwner].Files += [PSCustomObject]@{
+                $fileOwner = if ($FileOwnerMode) { Get-ItemOwner -Path $f.FullName } else { $rootOwner }
+                
+                if (!$usersData.ContainsKey($fileOwner)) {
+                    $usersData[$fileOwner] = @{
+                        TotalBadSize = 0
+                        TotalBadCount = 0
+                        Files = @()
+                    }
+                }
+                $usersData[$fileOwner].TotalBadSize += $f.Length
+                $usersData[$fileOwner].TotalBadCount += 1
+                
+                $usersData[$fileOwner].Files += [PSCustomObject]@{
                     Name = $f.Name
                     SizeMB = [math]::Round($f.Length / 1MB, 2)
                     Date = $f.LastWriteTime.ToString("yyyy-MM-dd")
@@ -188,7 +225,7 @@ try {
             }
         }
     }
-
+    
     Write-Progress -Activity "Scanning folders" -Completed
     Write-Host ""
     Write-Host "Scan completed in $([math]::Round(((Get-Date) - $scanStartTime).TotalMinutes, 1)) minutes" -ForegroundColor Green
@@ -324,11 +361,12 @@ $css
     <p>Folder: $SharePath</p>
     <p>Date: $(Get-Date -Format "dd.MM.yyyy HH:mm")</p>
     <p>Criteria: files older than $DaysOld days AND larger than $MinSizeMB MB</p>
+    <p>Mode: $(if ($FileOwnerMode) {'Per-file owner (accurate)'} else {'Per-folder owner (fast)'})</p>
   </div>
 
   <div class="cards">
     <div class="card">
-      <div class="card-label">Total Folders</div>
+      <div class="card-label">Total Folders Scanned</div>
       <div class="card-value">$($summaryReport.Count)</div>
     </div>
     <div class="card">
@@ -396,7 +434,7 @@ $summaryHtml += @"
   </div>
 
   <div class="section">
-    <h2>Folder Details</h2>
+    <h2>Folder Details (all levels)</h2>
     <table>
       <thead>
         <tr>
@@ -550,7 +588,7 @@ $css
     
     $outPath = Join-Path $HtmlDir "$user.html"
     $personalHtml | Out-File -FilePath $outPath -Encoding UTF8
-    Write-Host "  [OK] Personal HTML: $user ($count files, $totalGB GB)" -ForegroundColor Green
+    Write-Host "  [OK] Personal HTML: $user" -ForegroundColor Green
 }
 
 # ===== FINAL STATS =====
@@ -558,10 +596,9 @@ Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "SCAN COMPLETE" -ForegroundColor Cyan
 Write-Host "  Folder: $SharePath" -ForegroundColor White
+Write-Host "  Total folders scanned: $($summaryReport.Count)" -ForegroundColor White
 Write-Host "  Total size: $([math]::Round($totalSize, 2)) GB" -ForegroundColor White
-Write-Host "  Old+big files: $totalBadFiles files" -ForegroundColor Yellow
-Write-Host "  Space you can free up: $([math]::Round($totalBad, 2)) GB" -ForegroundColor Green
-Write-Host "  Old files share: $badPercent%" -ForegroundColor Yellow
+Write-Host "  Old+big files: $([math]::Round($totalBad, 2)) GB ($totalBadFiles files)" -ForegroundColor Yellow
 Write-Host "  Users with old files: $($usersData.Count)" -ForegroundColor White
 Write-Host "  Duration: $([math]::Round(((Get-Date) - $scanStartTime).TotalMinutes, 1)) minutes" -ForegroundColor White
 Write-Host "========================================" -ForegroundColor Cyan
