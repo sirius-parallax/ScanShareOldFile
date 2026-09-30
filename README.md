@@ -40,5 +40,11 @@ PowerShell-скрипт для анализа сетевого диска, по�
 
 ---
 
-
-cd network-disk-analyzer
+$SharePath  = "G:\share\net"   # Путь к папке для сканирования
+$DaysOld    = 730                     # Критерий "старости" файла (в днях)
+$MinSizeMB  = 50                      # Минимальный размер файла (в МБ)
+$OutputDir  = "C:\temp\reports"       # Папка для TXT-отчётов
+$HtmlDir    = "C:\temp\html_reports"  # Папка для HTML-отчётов
+$SummaryCSV = "C:\temp\SummaryReport.csv"  # Путь к CSV-файлу
+$LogFile    = "C:\temp\FullScanLog.txt"    # Путь к лог-файлу
+$Deadline   = (Get-Date).AddDays(14)  # Дедлайн для пользователей (автоматически)
