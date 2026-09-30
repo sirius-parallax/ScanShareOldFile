@@ -1,7 +1,8 @@
 # ============================================================
-# FullScan.ps1 - Network Disk Analyzer (Optimized)
+# FullScan.ps1 - Network Disk Analyzer (Final Optimized)
 # Рекурсивное сканирование всех уровней папок
 # Оптимизированная запись CSV через StreamWriter
+# Быстрая генерация HTML через StreamWriter (без зависаний)
 # Два режима определения владельца
 # ============================================================
 
@@ -22,6 +23,9 @@ $FileOwnerMode  = $false
 # Исключения папок (опционально). Оставьте пустым, если не нужно.
 # Пример: @("*\cache\*", "*\tmp\*", "*\node_modules\*")
 $ExcludePatterns = @()
+
+# Максимум строк в HTML-таблице (иначе браузер зависнет)
+$MaxHtmlRows = 200
 
 $CutoffDate     = (Get-Date).AddDays(-$DaysOld)
 $Deadline       = (Get-Date).AddDays(14).ToString("dd.MM.yyyy")
@@ -84,6 +88,11 @@ function Escape-CsvField {
         return '"' + $Value.Replace('"', '""') + '"'
     }
     return $Value
+}
+
+function Escape-Html {
+    param([string]$Value)
+    return $Value -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;'
 }
 
 # ===== MAIN SCAN =====
@@ -336,9 +345,9 @@ foreach ($user in $usersData.Keys) {
     Write-Host "  [OK] $user - $count files, $totalGB GB (free up $totalGB GB)" -ForegroundColor Green
 }
 
-# ===== GENERATE HTML REPORTS =====
+# ===== GENERATE HTML REPORTS (FAST via StreamWriter) =====
 Write-Host ""
-Write-Host "Generating HTML reports..." -ForegroundColor Cyan
+Write-Host "Generating HTML reports (optimized)..." -ForegroundColor Cyan
 
 $css = @"
 <style>
@@ -352,7 +361,6 @@ $css = @"
   .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.08); border-left: 4px solid #2a5298; }
   .card.danger { border-left-color: #e74c3c; }
   .card.warning { border-left-color: #f39c12; }
-  .card.success { border-left-color: #27ae60; }
   .card-label { font-size: 12px; color: #7f8c8d; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
   .card-value { font-size: 28px; font-weight: bold; color: #2c3e50; }
   .card-value.danger { color: #e74c3c; }
@@ -380,52 +388,40 @@ $css = @"
   .top-user-info { flex-grow: 1; }
   .top-user-name { font-weight: bold; color: #2c3e50; }
   .top-user-size { color: #e74c3c; font-weight: bold; font-size: 16px; }
+  .note { background: #fff8e1; border-left: 4px solid #f39c12; padding: 15px; margin: 15px 0; border-radius: 4px; font-size: 13px; color: #7f8c8d; }
 </style>
 "@
 
-# --- Summary HTML ---
-$summaryHtml = @"
-<!DOCTYPE html>
-<html lang="ru"><head><meta charset="UTF-8">
-<title>Summary Report</title>
-$css
-</head><body>
-<div class="container">
-  <div class="header">
-    <h1>Summary Report: Network Disk Analysis</h1>
-    <p>Folder: $SharePath</p>
-    <p>Date: $(Get-Date -Format "dd.MM.yyyy HH:mm")</p>
-    <p>Criteria: files older than $DaysOld days AND larger than $MinSizeMB MB</p>
-    <p>Mode: $(if ($FileOwnerMode) {'Per-file owner (accurate)'} else {'Per-folder owner (fast)'})</p>
-  </div>
+# --- Summary HTML via StreamWriter ---
+Write-Host "  Generating SUMMARY_REPORT.html..." -ForegroundColor Cyan
+$summaryHtmlPath = Join-Path $HtmlDir "SUMMARY_REPORT.html"
+$sw = [System.IO.StreamWriter]::new($summaryHtmlPath, $false, [System.Text.Encoding]::UTF8)
 
-  <div class="cards">
-    <div class="card">
-      <div class="card-label">Total Folders Scanned</div>
-      <div class="card-value">$($summaryReport.Count)</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Total Size</div>
-      <div class="card-value">$([math]::Round($totalSize, 2)) GB</div>
-    </div>
-    <div class="card danger">
-      <div class="card-label">Old Files Count</div>
-      <div class="card-value danger">$totalBadFiles</div>
-    </div>
-    <div class="card danger">
-      <div class="card-label">You Can Free Up</div>
-      <div class="card-value danger">$([math]::Round($totalBad, 2)) GB</div>
-      <div style="font-size:11px;color:#7f8c8d;margin-top:5px;">by deleting $totalBadFiles old files</div>
-    </div>
-    <div class="card warning">
-      <div class="card-label">Old Files Share</div>
-      <div class="card-value warning">$badPercent%</div>
-    </div>
-  </div>
+$sw.WriteLine("<!DOCTYPE html>")
+$sw.WriteLine("<html lang=`"ru`"><head><meta charset=`"UTF-8`">")
+$sw.WriteLine("<title>Summary Report</title>")
+$sw.WriteLine($css)
+$sw.WriteLine("</head><body>")
+$sw.WriteLine("<div class=`"container`">")
+$sw.WriteLine("  <div class=`"header`">")
+$sw.WriteLine("    <h1>Summary Report: Network Disk Analysis</h1>")
+$sw.WriteLine("    <p>Folder: $(Escape-Html $SharePath)</p>")
+$sw.WriteLine("    <p>Date: $(Get-Date -Format 'dd.MM.yyyy HH:mm')</p>")
+$sw.WriteLine("    <p>Criteria: files older than $DaysOld days AND larger than $MinSizeMB MB</p>")
+$sw.WriteLine("    <p>Mode: $(if ($FileOwnerMode) {'Per-file owner (accurate)'} else {'Per-folder owner (fast)'})</p>")
+$sw.WriteLine("  </div>")
 
-  <div class="section">
-    <h2>Top Users by Old Files</h2>
-"@
+# Cards
+$sw.WriteLine("  <div class=`"cards`">")
+$sw.WriteLine("    <div class=`"card`"><div class=`"card-label`">Total Folders Scanned</div><div class=`"card-value`">$($summaryReport.Count)</div></div>")
+$sw.WriteLine("    <div class=`"card`"><div class=`"card-label`">Total Size</div><div class=`"card-value`">$([math]::Round($totalSize, 2)) GB</div></div>")
+$sw.WriteLine("    <div class=`"card danger`"><div class=`"card-label`">Old Files Count</div><div class=`"card-value danger`">$totalBadFiles</div></div>")
+$sw.WriteLine("    <div class=`"card danger`"><div class=`"card-label`">You Can Free Up</div><div class=`"card-value danger`">$([math]::Round($totalBad, 2)) GB</div><div style=`"font-size:11px;color:#7f8c8d;margin-top:5px;`">by deleting $totalBadFiles old files</div></div>")
+$sw.WriteLine("    <div class=`"card warning`"><div class=`"card-label`">Old Files Share</div><div class=`"card-value warning`">$badPercent%</div></div>")
+$sw.WriteLine("  </div>")
+
+# Top users
+$sw.WriteLine("  <div class=`"section`"><h2>Top Users by Old Files</h2>")
 
 $userGroups = $summaryReport | Group-Object Owner | ForEach-Object {
     [PSCustomObject]@{
@@ -439,92 +435,63 @@ if ($userGroups.Count -gt 0) {
     $maxBadSize = $userGroups[0].BadSizeGB
     $rank = 1
     foreach ($u in $userGroups) {
-        $rankClass = ""
-        if ($rank -eq 1) { $rankClass = "gold" }
-        elseif ($rank -eq 2) { $rankClass = "silver" }
-        elseif ($rank -eq 3) { $rankClass = "bronze" }
-        
+        $rankClass = if ($rank -eq 1) {"gold"} elseif ($rank -eq 2) {"silver"} elseif ($rank -eq 3) {"bronze"} else {""}
         $barWidth = [math]::Round(($u.BadSizeGB / $maxBadSize) * 100, 0)
         
-        $summaryHtml += @"
-    <div class="top-user">
-      <div class="top-user-rank $rankClass">$rank</div>
-      <div class="top-user-info">
-        <div class="top-user-name">$($u.Owner)</div>
-        <div style="font-size:12px;color:#7f8c8d;">$($u.BadFiles) files</div>
-      </div>
-      <div style="flex-grow:1;margin:0 15px;">
-        <div class="bar-bg"><div class="bar-fill" style="width:$barWidth%">$barWidth%</div></div>
-      </div>
-      <div class="top-user-size">$($u.BadSizeGB) GB</div>
-    </div>
-"@
+        $sw.WriteLine("    <div class=`"top-user`">")
+        $sw.WriteLine("      <div class=`"top-user-rank $rankClass`">$rank</div>")
+        $sw.WriteLine("      <div class=`"top-user-info`"><div class=`"top-user-name`">$(Escape-Html $u.Owner)</div><div style=`"font-size:12px;color:#7f8c8d;`">$($u.BadFiles) files</div></div>")
+        $sw.WriteLine("      <div style=`"flex-grow:1;margin:0 15px;`"><div class=`"bar-bg`"><div class=`"bar-fill`" style=`"width:$barWidth%`">$barWidth%</div></div></div>")
+        $sw.WriteLine("      <div class=`"top-user-size`">$($u.BadSizeGB) GB</div>")
+        $sw.WriteLine("    </div>")
         $rank++
     }
 } else {
-    $summaryHtml += "<p>No users with old files found.</p>"
+    $sw.WriteLine("<p>No users with old files found.</p>")
 }
+$sw.WriteLine("  </div>")
 
-$summaryHtml += @"
-  </div>
+# Folder table (TOP N only)
+$sw.WriteLine("  <div class=`"section`"><h2>Folder Details (top $MaxHtmlRows by old size)</h2>")
+$sw.WriteLine("    <div class=`"note`">Showing top $MaxHtmlRows folders with most old files. Total folders in report: $($summaryReport.Count)</div>")
+$sw.WriteLine("    <table><thead><tr>")
+$sw.WriteLine("      <th>Folder</th><th>Owner</th><th>Total Files</th><th>Total Size</th>")
+$sw.WriteLine("      <th>Old Files</th><th>Old Size</th><th>Share</th><th>Visual</th>")
+$sw.WriteLine("    </tr></thead><tbody>")
 
-  <div class="section">
-    <h2>Folder Details (all levels)</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Folder</th>
-          <th>Owner</th>
-          <th>Total Files</th>
-          <th>Total Size</th>
-          <th>Old Files</th>
-          <th>Old Size</th>
-          <th>Share</th>
-          <th>Visual</th>
-        </tr>
-      </thead>
-      <tbody>
-"@
+$topFolders = $summaryReport | Sort-Object BadSizeGB -Descending | Select-Object -First $MaxHtmlRows
 
-foreach ($row in ($summaryReport | Sort-Object BadSizeGB -Descending)) {
+foreach ($row in $topFolders) {
     $folderBadPercent = if ($row.TotalSizeGB -gt 0) { [math]::Round(($row.BadSizeGB / $row.TotalSizeGB) * 100, 1) } else { 0 }
     $badgeClass = "badge-ok"
     if ($folderBadPercent -gt 50) { $badgeClass = "badge-danger" }
     elseif ($folderBadPercent -gt 20) { $badgeClass = "badge-warning" }
     
     $barWidth = [math]::Min($folderBadPercent, 100)
+    $folder = Escape-Html $row.Folder
+    $owner = Escape-Html $row.Owner
     
-    $summaryHtml += @"
-        <tr>
-          <td><b>$($row.Folder)</b></td>
-          <td>$($row.Owner)</td>
-          <td>$($row.TotalFiles)</td>
-          <td>$($row.TotalSizeGB) GB</td>
-          <td>$($row.BadFiles)</td>
-          <td><b>$($row.BadSizeGB) GB</b></td>
-          <td><span class="badge $badgeClass">$folderBadPercent%</span></td>
-          <td class="bar-cell"><div class="bar-bg"><div class="bar-fill" style="width:$barWidth%">$folderBadPercent%</div></div></td>
-        </tr>
-"@
+    $sw.WriteLine("    <tr>")
+    $sw.WriteLine("      <td><b>$folder</b></td><td>$owner</td><td>$($row.TotalFiles)</td><td>$($row.TotalSizeGB) GB</td>")
+    $sw.WriteLine("      <td>$($row.BadFiles)</td><td><b>$($row.BadSizeGB) GB</b></td>")
+    $sw.WriteLine("      <td><span class=`"badge $badgeClass`">$folderBadPercent%</span></td>")
+    $sw.WriteLine("      <td class=`"bar-cell`"><div class=`"bar-bg`"><div class=`"bar-fill`" style=`"width:$barWidth%`">$folderBadPercent%</div></div></td>")
+    $sw.WriteLine("    </tr>")
 }
 
-$summaryHtml += @"
-      </tbody>
-    </table>
-  </div>
+$sw.WriteLine("    </tbody></table>")
+$sw.WriteLine("  </div>")
 
-  <div class="footer">
-    Auto-generated report | IT Department | $(Get-Date -Format "dd.MM.yyyy")
-  </div>
-</div>
-</body></html>
-"@
+$sw.WriteLine("  <div class=`"footer`">Auto-generated report | IT Department | $(Get-Date -Format 'dd.MM.yyyy')</div>")
+$sw.WriteLine("</div></body></html>")
 
-$summaryHtmlPath = Join-Path $HtmlDir "SUMMARY_REPORT.html"
-$summaryHtml | Out-File -FilePath $summaryHtmlPath -Encoding UTF8
-Write-Host "  [OK] Summary HTML: $summaryHtmlPath" -ForegroundColor Green
+$sw.Close()
+Write-Host "  [OK] $summaryHtmlPath" -ForegroundColor Green
 
-# --- Personal HTML reports ---
+# --- Personal HTML reports via StreamWriter ---
+Write-Host ""
+Write-Host "Generating personal HTML reports..." -ForegroundColor Cyan
+
 foreach ($user in $usersData.Keys) {
     $data = $usersData[$user]
     $totalGB = [math]::Round($data.TotalBadSize / 1GB, 2)
@@ -532,98 +499,79 @@ foreach ($user in $usersData.Keys) {
     
     $sortedFiles = $data.Files | Sort-Object SizeMB -Descending
     
-    $personalHtml = @"
-<!DOCTYPE html>
-<html lang="ru"><head><meta charset="UTF-8">
-<title>Report for $user</title>
-$css
-</head><body>
-<div class="container">
-  <div class="header">
-    <h1>File Review Notification</h1>
-    <p>User: <b>$user</b> | Date: $(Get-Date -Format "dd.MM.yyyy HH:mm")</p>
-    <p>Folder: $SharePath</p>
-  </div>
-
-  <div class="cards">
-    <div class="card danger">
-      <div class="card-label">Old Files Found</div>
-      <div class="card-value danger">$count</div>
-    </div>
-    <div class="card danger">
-      <div class="card-label">You Can Free Up</div>
-      <div class="card-value danger">$totalGB GB</div>
-      <div style="font-size:11px;color:#7f8c8d;margin-top:5px;">by deleting $count old files</div>
-    </div>
-    <div class="card warning">
-      <div class="card-label">Deadline</div>
-      <div class="card-value warning" style="font-size:22px;">$Deadline</div>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>Files Requiring Review</h2>
-    <p style="color:#7f8c8d;font-size:13px;">Criteria: older than 2 years AND larger than $MinSizeMB MB. Sorted by size (descending).</p>
-    <table>
-      <thead>
-        <tr>
-          <th style="width:40px;">#</th>
-          <th>File Name</th>
-          <th style="width:100px;">Size</th>
-          <th style="width:110px;">Date</th>
-          <th style="width:150px;">Folder</th>
-          <th>Full Path</th>
-        </tr>
-      </thead>
-      <tbody>
-"@
+    $outPath = Join-Path $HtmlDir "$user.html"
+    $psw = [System.IO.StreamWriter]::new($outPath, $false, [System.Text.Encoding]::UTF8)
+    
+    $psw.WriteLine("<!DOCTYPE html>")
+    $psw.WriteLine("<html lang=`"ru`"><head><meta charset=`"UTF-8`">")
+    $psw.WriteLine("<title>Report for $(Escape-Html $user)</title>")
+    $psw.WriteLine($css)
+    $psw.WriteLine("</head><body>")
+    $psw.WriteLine("<div class=`"container`">")
+    $psw.WriteLine("  <div class=`"header`">")
+    $psw.WriteLine("    <h1>File Review Notification</h1>")
+    $psw.WriteLine("    <p>User: <b>$(Escape-Html $user)</b> | Date: $(Get-Date -Format 'dd.MM.yyyy HH:mm')</p>")
+    $psw.WriteLine("    <p>Folder: $(Escape-Html $SharePath)</p>")
+    $psw.WriteLine("  </div>")
+    
+    # Cards
+    $psw.WriteLine("  <div class=`"cards`">")
+    $psw.WriteLine("    <div class=`"card danger`"><div class=`"card-label`">Old Files Found</div><div class=`"card-value danger`">$count</div></div>")
+    $psw.WriteLine("    <div class=`"card danger`"><div class=`"card-label`">You Can Free Up</div><div class=`"card-value danger`">$totalGB GB</div><div style=`"font-size:11px;color:#7f8c8d;margin-top:5px;`">by deleting $count old files</div></div>")
+    $psw.WriteLine("    <div class=`"card warning`"><div class=`"card-label`">Deadline</div><div class=`"card-value warning`" style=`"font-size:22px;`">$Deadline</div></div>")
+    $psw.WriteLine("  </div>")
+    
+    # File table
+    $psw.WriteLine("  <div class=`"section`"><h2>Files Requiring Review</h2>")
+    $psw.WriteLine("    <p style=`"color:#7f8c8d;font-size:13px;`">Criteria: older than 2 years AND larger than $MinSizeMB MB. Sorted by size (descending).</p>")
+    $psw.WriteLine("    <table><thead><tr>")
+    $psw.WriteLine("      <th style=`"width:40px;`">#</th><th>File Name</th><th style=`"width:100px;`">Size</th>")
+    $psw.WriteLine("      <th style=`"width:110px;`">Date</th><th style=`"width:150px;`">Folder</th><th>Full Path</th>")
+    $psw.WriteLine("    </tr></thead><tbody>")
     
     $idx = 1
     foreach ($f in $sortedFiles) {
-        $personalHtml += @"
-        <tr>
-          <td><b>$idx</b></td>
-          <td><b>$($f.Name)</b></td>
-          <td><span class="badge badge-danger">$($f.SizeMB) MB</span></td>
-          <td>$($f.Date)</td>
-          <td>$($f.Folder)</td>
-          <td class="path-cell">$($f.Path)</td>
-        </tr>
-"@
+        $name = Escape-Html $f.Name
+        $path = Escape-Html $f.Path
+        $folder = Escape-Html $f.Folder
+        
+        $psw.WriteLine("    <tr>")
+        $psw.WriteLine("      <td><b>$idx</b></td><td><b>$name</b></td>")
+        $psw.WriteLine("      <td><span class=`"badge badge-danger`">$($f.SizeMB) MB</span></td>")
+        $psw.WriteLine("      <td>$($f.Date)</td><td>$folder</td>")
+        $psw.WriteLine("      <td class=`"path-cell`">$path</td>")
+        $psw.WriteLine("    </tr>")
         $idx++
     }
     
-    $personalHtml += @"
-      </tbody>
-    </table>
-  </div>
-
-  <div class="section" style="background:#fff8e1;border-left:4px solid #f39c12;">
-    <h2 style="color:#d68910;">Required Actions</h2>
-    <ol style="font-size:14px;line-height:1.8;">
-      <li>Review the file list above</li>
-      <li><b>Delete</b> unnecessary files to free up <b>$totalGB GB</b></li>
-      <li><b>Move</b> important files to personal archive</li>
-      <li>Reply with results by <b>$Deadline</b></li>
-    </ol>
-    <p style="margin-top:15px;padding:10px;background:#e8f8f5;border-radius:4px;font-size:13px;color:#1e8449;">
-      By cleaning up these $count files, you will free up <b>$totalGB GB</b> of disk space.
-    </p>
-    <p style="margin-top:15px;font-size:13px;color:#7f8c8d;">
-      If all files are important and cannot be deleted, please inform us. We will consider moving them to archive storage.
-    </p>
-  </div>
-
-  <div class="footer">
-    IT Department | $(Get-Date -Format "dd.MM.yyyy")
-  </div>
-</div>
-</body></html>
-"@
+    $psw.WriteLine("    </tbody></table>")
+    $psw.WriteLine("  </div>")
     
-    $outPath = Join-Path $HtmlDir "$user.html"
-    $personalHtml | Out-File -FilePath $outPath -Encoding UTF8
-    Write-Host "  [OK] Personal HTML: $user" -ForegroundColor Green
+    # Instructions
+    $psw.WriteLine("  <div class=`"section`" style=`"background:#fff8e1;border-left:4px solid #f39c12;`">")
+    $psw.WriteLine("    <h2 style=`"color:#d68910;`">Required Actions</h2>")
+    $psw.WriteLine("    <ol style=`"font-size:14px;line-height:1.8;`">")
+    $psw.WriteLine("      <li>Review the file list above</li>")
+    $psw.WriteLine("      <li><b>Delete</b> unnecessary files to free up <b>$totalGB GB</b></li>")
+    $psw.WriteLine("      <li><b>Move</b> important files to personal archive</li>")
+    $psw.WriteLine("      <li>Reply with results by <b>$Deadline</b></li>")
+    $psw.WriteLine("    </ol>")
+    $psw.WriteLine("    <p style=`"margin-top:15px;padding:10px;background:#e8f8f5;border-radius:4px;font-size:13px;color:#1e8449;`">")
+    $psw.WriteLine("      By cleaning up these $count files, you will free up <b>$totalGB GB</b> of disk space.")
+    $psw.WriteLine("    </p>")
+    $psw.WriteLine("    <p style=`"margin-top:15px;font-size:13px;color:#7f8c8d;`">")
+    $psw.WriteLine("      If all files are important and cannot be deleted, please inform us. We will consider moving them to archive storage.")
+    $psw.WriteLine("    </p>")
+    $psw.WriteLine("  </div>")
+    
+    $psw.WriteLine("  <div class=`"footer`">IT Department | $(Get-Date -Format 'dd.MM.yyyy')</div>")
+    $psw.WriteLine("</div></body></html>")
+    
+    $psw.Close()
+    Write-Host "  [OK] $user ($count files, $totalGB GB)" -ForegroundColor Green
+    
+    # Free memory after each user
+    [System.GC]::Collect()
 }
 
 # ===== FINAL STATS =====
