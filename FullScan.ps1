@@ -5,7 +5,7 @@
 # ============================================================
 
 # ===== SETTINGS =====
-$SharePath      = "G:\expnet.ru\Common"
+$SharePath      = "G:\share\net"
 $DaysOld        = 730
 $MinSizeMB      = 50
 $OutputDir      = "C:\temp\reports"
