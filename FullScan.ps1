@@ -1,7 +1,8 @@
 # ============================================================
-# FullScan.ps1 - Network Disk Analyzer (Recursive Version)
-# Рекурсивно сканирует все папки всех уровней
-# Определяет реальных владельцев папок и файлов
+# FullScan.ps1 - Network Disk Analyzer (Optimized)
+# Рекурсивное сканирование всех уровней папок
+# Оптимизированная запись CSV через StreamWriter
+# Два режима определения владельца
 # ============================================================
 
 # ===== SETTINGS =====
@@ -14,9 +15,13 @@ $SummaryCSV     = "C:\temp\SummaryReport.csv"
 $LogFile        = "C:\temp\FullScanLog.txt"
 
 # Режим определения владельца:
-# $false = по папкам (БЫСТРО, рекомендуется) - владелец папки = владелец всех файлов в ней
-# $true  = по файлам (МЕДЛЕННО, но точно) - для каждого файла отдельный запрос к NTFS
+# $false = по папкам (БЫСТРО, рекомендуется)
+# $true  = по файлам (МЕДЛЕННО, но точно)
 $FileOwnerMode  = $false
+
+# Исключения папок (опционально). Оставьте пустым, если не нужно.
+# Пример: @("*\cache\*", "*\tmp\*", "*\node_modules\*")
+$ExcludePatterns = @()
 
 $CutoffDate     = (Get-Date).AddDays(-$DaysOld)
 $Deadline       = (Get-Date).AddDays(14).ToString("dd.MM.yyyy")
@@ -32,6 +37,7 @@ Write-Host "SCAN STARTED: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Foreground
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Path: $SharePath" -ForegroundColor White
 Write-Host "Mode: $(if ($FileOwnerMode) {'FILE OWNER (slow)'} else {'FOLDER OWNER (fast)'})" -ForegroundColor White
+Write-Host "Exclude patterns: $(if ($ExcludePatterns.Count -gt 0) {$ExcludePatterns.Count} else {'none'})" -ForegroundColor White
 Write-Host ""
 
 # ===== PATH VALIDATION =====
@@ -72,21 +78,50 @@ function Format-Size {
     return "$Bytes B"
 }
 
+function Escape-CsvField {
+    param([string]$Value)
+    if ($Value -match '[,"\n]') {
+        return '"' + $Value.Replace('"', '""') + '"'
+    }
+    return $Value
+}
+
 # ===== MAIN SCAN =====
 $usersData = @{}
 $summaryReport = @()
 $scanStartTime = Get-Date
 
 try {
-    # РЕКУРСИВНОЕ сканирование всех папок всех уровней
+    # Collect all folders recursively
     Write-Host "Collecting all folders recursively..." -ForegroundColor Yellow
     $allFolders = Get-ChildItem -Path $SharePath -Directory -Recurse -ErrorAction SilentlyContinue
+    
+    # Apply exclusions if any
+    if ($ExcludePatterns.Count -gt 0) {
+        $beforeCount = $allFolders.Count
+        $allFolders = $allFolders | Where-Object {
+            $path = $_.FullName
+            $exclude = $false
+            foreach ($pattern in $ExcludePatterns) {
+                if ($path -like $pattern) { $exclude = $true; break }
+            }
+            !$exclude
+        }
+        Write-Host "Excluded $($beforeCount - $allFolders.Count) folders by patterns" -ForegroundColor Yellow
+    }
+    
     Write-Host "Found $($allFolders.Count) folders total (all levels)" -ForegroundColor Green
     
-    # Также файлы в корне
+    # Root files
     $rootFiles = Get-ChildItem -Path $SharePath -File -ErrorAction SilentlyContinue
     Write-Host "Found $($rootFiles.Count) files in root" -ForegroundColor Green
     Write-Host ""
+    
+    # === OPTIMIZED CSV: create header and open StreamWriter ===
+    $csvHeader = "Folder,Owner,TotalFiles,TotalSizeGB,BadFiles,BadSizeGB,Path"
+    $csvHeader | Out-File -FilePath $SummaryCSV -Encoding UTF8 -Force
+    $csvWriter = [System.IO.StreamWriter]::new($SummaryCSV, $true, [System.Text.Encoding]::UTF8)
+    Write-Host "CSV writer opened (optimized mode)" -ForegroundColor DarkGray
     
     $totalFolders = $allFolders.Count
     $current = 0
@@ -96,7 +131,6 @@ try {
         $elapsed = (Get-Date) - $scanStartTime
         $elapsedMin = [math]::Round($elapsed.TotalMinutes, 1)
         
-        # Показываем относительный путь для наглядности
         $relativePath = $folder.FullName.Replace($SharePath, "").TrimStart("\")
         
         Write-Progress -Activity "Scanning folders" -Status "$relativePath ($current/$totalFolders) [$elapsedMin min]" -PercentComplete (($current/$totalFolders)*100)
@@ -105,21 +139,19 @@ try {
             Write-Host "[$current/$totalFolders] $relativePath" -ForegroundColor Yellow
         }
         
-        # Определяем владельца
+        # Determine owner
         if ($FileOwnerMode) {
-            # В режиме пофайлового сканирования владелец определяется для каждого файла отдельно
             $folderOwner = "per-file"
         } else {
-            # В режиме по папкам - владелец папки
             $folderOwner = Get-ItemOwner -Path $folder.FullName
         }
         
-        # Сканируем файлы ТОЛЬКО в этой папке (без рекурсии, чтобы не дублировать)
+        # Scan files ONLY in this folder (no recursion to avoid duplicates)
         $folderFiles = Get-ChildItem -Path $folder.FullName -File -ErrorAction SilentlyContinue
         $totalSize = ($folderFiles | Measure-Object -Property Length -Sum).Sum
         if ($null -eq $totalSize) { $totalSize = 0 }
         
-        # Фильтруем старые и большие файлы
+        # Filter old and big files
         $badFiles = $folderFiles | Where-Object { 
             $_.LastWriteTime -lt $CutoffDate -and $_.Length -ge ($MinSizeMB * 1MB) 
         }
@@ -127,7 +159,7 @@ try {
         if ($null -eq $badSize) { $badSize = 0 }
         $badCount = @($badFiles).Count
         
-        # Добавляем в сводный отчёт
+        # Add to summary report
         $summaryReport += [PSCustomObject]@{
             Folder      = $relativePath
             Owner       = $folderOwner
@@ -138,10 +170,16 @@ try {
             Path        = $folder.FullName
         }
         
-        # Обрабатываем старые файлы для персональных отчётов
+        # === OPTIMIZED: append one line to CSV every 10 folders ===
+        if ($current % 10 -eq 0) {
+            $lastRow = $summaryReport[-1]
+            $line = "$(Escape-CsvField $lastRow.Folder),$(Escape-CsvField $lastRow.Owner),$($lastRow.TotalFiles),$($lastRow.TotalSizeGB),$($lastRow.BadFiles),$($lastRow.BadSizeGB),$(Escape-CsvField $lastRow.Path)"
+            $csvWriter.WriteLine($line)
+        }
+        
+        # Process bad files for personal reports
         if ($badCount -gt 0) {
             foreach ($f in $badFiles) {
-                # Определяем владельца файла
                 if ($FileOwnerMode) {
                     $fileOwner = Get-ItemOwner -Path $f.FullName
                 } else {
@@ -167,15 +205,9 @@ try {
                 }
             }
         }
-        
-        # Промежуточное сохранение каждые 50 папок
-        if ($current % 50 -eq 0) {
-            $summaryReport | Sort-Object BadSizeGB -Descending | Export-Csv -Path $SummaryCSV -NoTypeInformation -Encoding UTF8
-            Write-Host "  [Intermediate save] CSV updated ($current folders)" -ForegroundColor DarkGray
-        }
     }
     
-    # Обработка файлов в корне
+    # Process root files
     if ($rootFiles.Count -gt 0) {
         Write-Host ""
         Write-Host "Scanning root files..." -ForegroundColor Yellow
@@ -226,14 +258,16 @@ try {
         }
     }
     
-    Write-Progress -Activity "Scanning folders" -Completed
+    # Close CSV writer
+    $csvWriter.Close()
     Write-Host ""
-    Write-Host "Scan completed in $([math]::Round(((Get-Date) - $scanStartTime).TotalMinutes, 1)) minutes" -ForegroundColor Green
+    Write-Host "CSV writer closed. Scan completed in $([math]::Round(((Get-Date) - $scanStartTime).TotalMinutes, 1)) minutes" -ForegroundColor Green
 
 } catch {
     Write-Host ""
     Write-Host "ERROR during scan: $_" -ForegroundColor Red
     Write-Host "Partial data will be saved." -ForegroundColor Yellow
+    if ($csvWriter) { $csvWriter.Close() }
 }
 
 # ===== CALCULATE TOTALS =====
@@ -242,11 +276,12 @@ $totalBad  = ($summaryReport | Measure-Object BadSizeGB -Sum).Sum
 $totalBadFiles = ($summaryReport | Measure-Object BadFiles -Sum).Sum
 $badPercent = if ($totalSize -gt 0) { [math]::Round(($totalBad / $totalSize) * 100, 1) } else { 0 }
 
-# ===== SAVE SUMMARY CSV =====
+# ===== FINAL SORTED CSV =====
 Write-Host ""
-Write-Host "Saving Summary CSV..." -ForegroundColor Cyan
-$summaryReport | Sort-Object BadSizeGB -Descending | Export-Csv -Path $SummaryCSV -NoTypeInformation -Encoding UTF8
-Write-Host "  [OK] $SummaryCSV" -ForegroundColor Green
+Write-Host "Sorting and finalizing Summary CSV..." -ForegroundColor Cyan
+$sortedReport = $summaryReport | Sort-Object BadSizeGB -Descending
+$sortedReport | Export-Csv -Path $SummaryCSV -NoTypeInformation -Encoding UTF8
+Write-Host "  [OK] $SummaryCSV ($($summaryReport.Count) rows, sorted)" -ForegroundColor Green
 
 # ===== SAVE PERSONAL TXT REPORTS =====
 Write-Host ""
@@ -599,6 +634,7 @@ Write-Host "  Folder: $SharePath" -ForegroundColor White
 Write-Host "  Total folders scanned: $($summaryReport.Count)" -ForegroundColor White
 Write-Host "  Total size: $([math]::Round($totalSize, 2)) GB" -ForegroundColor White
 Write-Host "  Old+big files: $([math]::Round($totalBad, 2)) GB ($totalBadFiles files)" -ForegroundColor Yellow
+Write-Host "  Space you can free up: $([math]::Round($totalBad, 2)) GB" -ForegroundColor Green
 Write-Host "  Users with old files: $($usersData.Count)" -ForegroundColor White
 Write-Host "  Duration: $([math]::Round(((Get-Date) - $scanStartTime).TotalMinutes, 1)) minutes" -ForegroundColor White
 Write-Host "========================================" -ForegroundColor Cyan
